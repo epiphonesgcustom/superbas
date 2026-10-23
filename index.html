@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="sv">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Superbase Web</title>
+<meta name="description" content="Öppna, sök i och rita diagram av Superbase 4-databaser (.SBF/.SBD) direkt i webbläsaren. Filerna lämnar aldrig din dator.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%232f5fd0'/%3E%3Cellipse cx='16' cy='9' rx='9' ry='4' fill='white'/%3E%3Cpath d='M7 9v14c0 2.2 4 4 9 4s9-1.8 9-4V9c0 2.2-4 4-9 4S7 11.2 7 9z' fill='white' opacity='.8'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="logo" aria-hidden="true"></span><h1>Superbase Web</h1></div>
+  <div class="actions">
+    <button id="btnOpen" class="primary" type="button">Öppna mapp…</button>
+    <label class="cs" title="Superbase lagrar text i den gamla DOS-teckenuppsättningen">Teckenuppsättning
+      <select id="charset">
+        <option value="cp850">DOS 850 (västeuropeisk)</option>
+        <option value="cp437">DOS 437 (USA)</option>
+        <option value="latin1">Latin-1</option>
+      </select>
+    </label>
+  </div>
+  <input id="folderInput" type="file" webkitdirectory multiple hidden>
+</header>
+
+<div id="notes" class="notes" role="status" aria-live="polite"></div>
+
+<div class="layout">
+  <aside id="side" class="side" hidden>
+    <section>
+      <h2>Databaser</h2>
+      <ul id="dbList" class="dblist"></ul>
+    </section>
+    <section>
+      <div class="row between"><h2>Fält</h2>
+        <span class="mini"><button type="button" data-cols="default">Standard</button><button type="button" data-cols="all">Alla</button><button type="button" data-cols="none">Inga</button></span>
+      </div>
+      <p class="hint">Bocka i för att visa en kolumn. Klicka på ett namn för att lägga in det i sökningen.</p>
+      <ul id="fieldList" class="fieldlist"></ul>
+    </section>
+  </aside>
+
+  <main id="main" class="main">
+    <div id="empty" class="empty">
+      <div class="drop">
+        <h2>Öppna en Superbase 4-databas</h2>
+        <p>Välj mappen där dina databaser ligger – alla <code>.SBD</code>- och <code>.SBF</code>-filer (även i undermappar) laddas automatiskt.<br>
+        Allt läses i din webbläsare – ingenting laddas upp.</p>
+        <p><button id="btnOpen2" class="primary" type="button">Öppna mapp…</button></p>
+      </div>
+    </div>
+
+    <div id="work" hidden>
+      <form id="queryForm" class="query" autocomplete="off">
+        <label class="grow">Där
+          <input id="qWhere" type="text" spellcheck="false" placeholder='t.ex. PLATS = "Larsson" OCH DATUM >= 2013-01-01   ·   TITEL INNEHÅLLER "love"'>
+        </label>
+        <label class="mid">Sortera efter
+          <input id="qOrder" type="text" spellcheck="false" placeholder="DATUM FALLANDE, PLATS">
+        </label>
+        <button class="primary" type="submit">Sök</button>
+        <button id="qClear" type="button">Rensa</button>
+        <details class="help"><summary>Hjälp</summary>
+          <div class="helpbody">
+            <p><b>Operatorer</b> <code>= &lt;&gt; &lt; &gt; &lt;= &gt;=</code> <code>LIKT</code> (<code>*</code> valfri text, <code>?</code> ett tecken) <code>INNEHÅLLER</code> <code>OCH ELLER INTE</code> <code>( )</code> <code>+ - * /</code></p>
+            <p><b>Fält</b> skrivs med namn; använd <code>[hakparentes]</code> eller understreck för mellanslag: <code>[TYP AV PROVNING]</code>. <code>FÄLT.FIL</code> fungerar också.</p>
+            <p><b>Värden</b> <code>"text"</code>, <code>123.5</code>, datum som <code>2013-10-16</code></p>
+            <p><b>Funktioner</b> <code>STORA SMÅ TRIM LÄNGD VÄNSTER HÖGER MITT VAL STR ABS HELTAL AVRUNDA ÅR MÅNAD DAG</code></p>
+            <p>Engelska ord fungerar också (<code>AND OR NOT LIKE CONTAINS</code>, <code>YEAR</code> …).</p>
+          </div>
+        </details>
+      </form>
+      <div id="qError" class="qerror" hidden></div>
+
+      <div class="bar">
+        <div role="tablist" class="tabs" aria-label="Vyer">
+          <button role="tab" data-tab="table" aria-selected="true">Tabell</button>
+          <button role="tab" data-tab="form" aria-selected="false">Formulär</button>
+          <button role="tab" data-tab="chart" aria-selected="false">Diagram</button>
+          <button role="tab" data-tab="structure" aria-selected="false">Struktur</button>
+        </div>
+        <div class="count" id="count"></div>
+        <button id="btnCsv" type="button" title="Ladda ner det aktuella urvalet som CSV">Exportera CSV</button>
+      </div>
+
+      <section id="tab-table" class="tab">
+        <div class="tablewrap"><table id="grid" class="grid"></table></div>
+        <div id="pager" class="pager"></div>
+      </section>
+
+      <section id="tab-form" class="tab" hidden>
+        <div class="formnav">
+          <button type="button" id="fFirst" aria-label="Första posten">«</button>
+          <button type="button" id="fPrev" aria-label="Föregående post">‹</button>
+          <span id="fPos"></span>
+          <button type="button" id="fNext" aria-label="Nästa post">›</button>
+          <button type="button" id="fLast" aria-label="Sista posten">»</button>
+        </div>
+        <div id="formBody" class="formbody"></div>
+      </section>
+
+      <section id="tab-chart" class="tab" hidden>
+        <div class="chartctl" id="chartCtl">
+          <label>Diagram
+            <select id="cType">
+              <option value="bar">Stapel</option>
+              <option value="hbar">Liggande stapel</option>
+              <option value="line">Linje</option>
+              <option value="pie">Cirkel</option>
+              <option value="scatter">Punktdiagram</option>
+            </select>
+          </label>
+          <label>X-axel <select id="cX"></select></label>
+          <label id="cGroupWrap">Gruppera <select id="cGroup"></select></label>
+          <label id="cMeasureWrap">Mått
+            <select id="cMeasure">
+              <option value="count">Antal poster</option>
+              <option value="sum">Summa av…</option>
+              <option value="avg">Medelvärde av…</option>
+              <option value="min">Minsta av…</option>
+              <option value="max">Största av…</option>
+            </select>
+          </label>
+          <label id="cYWrap"><span id="cYLabel">Fält</span> <select id="cY"></select></label>
+          <label id="cSortWrap">Sortering
+            <select id="cSort">
+              <option value="x">Efter X</option>
+              <option value="val">Störst först</option>
+            </select>
+          </label>
+          <label id="cTopWrap">Visa <input id="cTop" type="number" min="0" value="25" step="5"> <span class="muted">(0 = alla)</span></label>
+          <button type="button" id="cSave">Spara SVG</button>
+        </div>
+        <div id="chartMsg" class="hint"></div>
+        <div id="chartBox" class="chartbox"></div>
+      </section>
+
+      <section id="tab-structure" class="tab" hidden>
+        <div id="structInfo" class="structinfo"></div>
+        <div class="tablewrap"><table id="structTable" class="grid"></table></div>
+      </section>
+    </div>
+  </main>
+</div>
+
+<footer class="foot">Skrivskyddad läsare för Superbase 4 för Windows-filer · körs helt i din webbläsare</footer>
+<script src="sb.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
