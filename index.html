@@ -81,6 +81,9 @@
           <button role="tab" data-tab="structure" aria-selected="false">Struktur</button>
         </div>
         <div class="count" id="count"></div>
+        <button id="btnNew" type="button" hidden>Ny post</button>
+        <button id="btnEdit" type="button" aria-pressed="false">Redigera</button>
+        <button id="btnSaveDisk" class="primary" type="button" hidden>Spara till disk</button>
         <button id="btnCsv" type="button" title="Ladda ner det aktuella urvalet som CSV">Exportera CSV</button>
       </div>
 
@@ -96,6 +99,12 @@
           <span id="fPos"></span>
           <button type="button" id="fNext" aria-label="Nästa post">›</button>
           <button type="button" id="fLast" aria-label="Sista posten">»</button>
+          <span id="editBtns" class="editbtns" hidden>
+            <button type="button" id="fNew">Ny post</button>
+            <button type="button" id="fApply" class="primary">Uppdatera post</button>
+            <button type="button" id="fRevert">Ångra</button>
+            <button type="button" id="fDelete" class="danger">Ta bort post</button>
+          </span>
         </div>
         <div id="formBody" class="formbody"></div>
       </section>

@@ -128,6 +128,142 @@
     return out;
   }
 
+
+  /* ---------- writing ----------
+     Records are re-encoded the same way they are read. Only changed or new records are touched: they keep
+     their slot (and continuation chain), grow into new slots appended at the end of the used area, and the
+     header's record count (u32[3]) and next-free-slot (u32[4]) are updated. Index files are NOT updated. */
+  const INV = {};
+  function encodeChar(ch, cs) {
+    const c = ch.charCodeAt(0);
+    if (c < 128) return c;
+    if (cs === 'latin1') { if (c < 256) return c; throw new Error("Tecknet '" + ch + "' kan inte lagras"); }
+    const tbl = HIGH[cs] || HIGH.cp850;
+    const m = INV[cs] || (INV[cs] = new Map(Array.from(tbl, (t, i) => [t, 128 + i])));
+    if (!m.has(ch)) throw new Error("Tecknet '" + ch + "' kan inte lagras i teckenuppsättningen " + cs);
+    return m.get(ch);
+  }
+  function encodeText(str, cs) {
+    const out = [];
+    for (const ch of String(str)) {
+      if (ch === '\0') continue;
+      out.push(encodeChar(ch, cs));
+    }
+    return out;
+  }
+  function encodeRecord(fields, v, cs) {
+    const out = [];
+    fields.forEach((f, k) => {
+      const x = v[k];
+      if (f.type === 'DEL') { out.push(0); return; }
+      if (x === null || x === undefined || (x === '' && f.type !== 'TXT')) { out.push(0); return; }
+      if (typeof x === 'string') { out.push(...encodeText(x, cs), 0); return; }
+      if (!isFinite(x)) { out.push(0); return; }
+      const b = new Uint8Array(10), dv = new DataView(b.buffer);
+      if (f.type === 'NUM') { b[0] = 0xff; b[1] = 8; dv.setFloat64(2, x, true); out.push(...b.subarray(0, 10)); }
+      else if (f.type === 'NMI' && x >= -32768 && x <= 32767) { b[0] = 0xff; b[1] = 2; dv.setInt16(2, x, true); out.push(...b.subarray(0, 4)); }
+      else { b[0] = 0xff; b[1] = 4; dv.setInt32(2, x, true); out.push(...b.subarray(0, 6)); }
+    });
+    return Uint8Array.from(out);
+  }
+
+  /* records: db.records ({id, v, dirty, isNew}). Returns {bytes, newIds: [[record, id]...]}. */
+  function applyEdits(sbf, fields, records, cs) {
+    const dv0 = new DataView(sbf.buffer, sbf.byteOffset, sbf.byteLength);
+    const S = dv0.getUint32(20, true), P = S - 4, n0 = Math.floor(sbf.length / S);
+    if (S < 32 || S > 65536) throw new Error('Felaktig blockstorlek');
+    const u32 = i => dv0.getUint32(i * S, true);
+    let last = 0;
+    for (let i = n0 - 1; i >= 1 && !last; i--) {
+      if (u32(i) !== 0) { last = i; break; }
+      for (let j = i * S + 4; j < (i + 1) * S; j++) if (sbf[j]) { last = i; break; }
+    }
+    let next = Math.max(dv0.getUint32(16, true), last + 1);
+    const writes = new Map(), newIds = [];
+    const put = (slot, flag, nextPtr, chunk) => {
+      const b = new Uint8Array(S);
+      new DataView(b.buffer).setUint32(0, ((flag | nextPtr) >>> 0), true);
+      b.set(chunk, 4);
+      writes.set(slot, b);
+    };
+    let added = 0;
+    const doomed = [];
+    for (const r of records) {
+      if (r.deleted) { if (!r.isNew) doomed.push(r); continue; }
+      if (!r.isNew && !r.dirty) continue;
+      const body = encodeRecord(fields, r.v, cs);
+      const need = Math.max(1, Math.ceil(body.length / P));
+      let chain = [];
+      if (r.isNew) { chain = [next++]; added++; }
+      else {
+        chain = [r.id];
+        let p = u32(r.id) & 0xffffff, guard = 0;
+        while (p && p < n0 && guard++ < 4096) { chain.push(p); p = u32(p) & 0xffffff; }
+      }
+      while (chain.length < need) chain.push(next++);
+      for (let k = 0; k < need; k++) {
+        put(chain[k], k === 0 ? 0x80000000 : 0, k + 1 < need ? chain[k + 1] : 0, body.subarray(k * P, (k + 1) * P));
+      }
+      for (let k = need; k < chain.length; k++) put(chain[k], 0, 0, new Uint8Array(0)); // release unused continuation slots
+      if (r.isNew) newIds.push([r, chain[0]]);
+    }
+    /* Deleting: the record's slots are pushed onto the file's free list. Header u32[0] low 24 bits = head
+       of the list, u32[1] = number of slots in it; each listed slot has bit 30 set and points to the next
+       listed slot. A one-slot record becomes 0x40|next; a longer record keeps its chain: head 0xC0, the
+       other slots 0x40, and the last slot continues into the old list (layout seen in real files). */
+    let listHead = dv0.getUint32(0, true) & 0xffffff, listSlots = dv0.getUint32(4, true), headFlags = dv0.getUint32(0, true) >>> 24 | 0x40;
+    const chainOf = id => {
+      const c = [id];
+      let p = u32(id) & 0xffffff, guard = 0;
+      while (p && p < n0 && guard++ < 4096) { c.push(p); p = u32(p) & 0xffffff; }
+      return c;
+    };
+    const rehead = (slot, word) => {
+      const b = sbf.slice(slot * S, (slot + 1) * S);
+      new DataView(b.buffer).setUint32(0, word >>> 0, true);
+      writes.set(slot, b);
+    };
+    for (const r of doomed) {
+      const c = chainOf(r.id);
+      if (c.length === 1) rehead(c[0], 0x40000000 | listHead);
+      else {
+        headFlags |= 0x80;
+        c.forEach((slot, k) => rehead(slot, ((k === 0 ? 0xc0 : 0x40) << 24 | (k + 1 < c.length ? c[k + 1] : listHead)) >>> 0));
+      }
+      listHead = c[0]; listSlots += c.length;
+    }
+    const total = Math.max(n0, next);
+    const bytes = new Uint8Array(total * S);
+    bytes.set(sbf.subarray(0, n0 * S));
+    for (const [slot, b] of writes) bytes.set(b, slot * S);
+    const dv = new DataView(bytes.buffer);
+    if (doomed.length) {
+      dv.setUint32(0, ((headFlags << 24) | listHead) >>> 0, true);
+      dv.setUint32(4, listSlots, true);
+    }
+    dv.setUint32(12, dv0.getUint32(12, true) + added - doomed.length, true);
+    dv.setUint32(16, next, true);
+    return { bytes, newIds };
+  }
+
+  /* recompute calculated (CLC) fields of a record's value array in definition order */
+  function makeCalc(fields) {
+    const fns = [];
+    fields.forEach((f, i) => {
+      if (!f.calc || !f.formula) return;
+      const fn = compileExpr(f.formula, fields, null, true);
+      fns.push(v => {
+        let x = fn({ v });
+        if (typeof x === 'boolean') x = x ? -1 : 0;
+        if (typeof x === 'number' && isFinite(x)) {
+          if (f.decimals !== undefined) { const p = Math.pow(10, f.decimals); x = Math.round(x * p + (x < 0 ? -1e-9 : 1e-9)) / p; }
+          v[i] = x;
+        } else v[i] = typeof x === 'string' ? x : (f.type === 'TXT' ? '' : null);
+      });
+    });
+    return v => { for (const fn of fns) fn(v); return v; };
+  }
+
   /* ---------- formatting ---------- */
   function formatValue(f, v) {
     if (v === null || v === undefined) return '';
@@ -244,7 +380,7 @@
   }
   const contains = (a, b) => text(a).toLowerCase().includes(text(b).toLowerCase());
 
-  function compileExpr(src, fields, dbName) {
+  function compileExpr(src, fields, dbName, raw) {
     const toks = tokenize(src, dbName);
     const byName = new Map();
     fields.forEach((f, i) => { if (!byName.has(norm(f.name))) byName.set(norm(f.name), i); });
@@ -338,7 +474,7 @@
 
     const e = toks.length ? parseOr() : () => true;
     if (p < toks.length) throw new Error("Oväntat '" + toks[p].v + "'");
-    return r => truthy(e(r));
+    return raw ? e : r => truthy(e(r));
   }
 
   /* ORDER BY "FIELD [ASC|DESC], ..." -> [{idx, desc}] */
@@ -377,7 +513,7 @@
         else c = coll.compare(String(a), String(b));
         if (c) return o.desc ? -c : c;
       }
-      return x.id - y.id;
+      return (x.id || 0) - (y.id || 0);
     });
   }
 
@@ -388,6 +524,6 @@
     return sortRecords(rows, order);
   }
 
-  const api = { CHARSETS, decode, ordToISO, isoToOrd, ordParts, parseSBD, readDatabase, formatValue, compileExpr, parseOrder, sortRecords, query, norm };
+  const api = { applyEdits, encodeRecord, encodeText, makeCalc, CHARSETS, decode, ordToISO, isoToOrd, ordParts, parseSBD, readDatabase, formatValue, compileExpr, parseOrder, sortRecords, query, norm };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.SB = api;
 })(typeof self !== 'undefined' ? self : this);

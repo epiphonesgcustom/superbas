@@ -150,3 +150,14 @@ body.dragging .drop { background: var(--hover); }
   .actions { margin-left: 0; }
 }
 
+
+.editbtns { display: flex; gap: 6px; margin-left: auto; }
+.formnav { flex-wrap: wrap; }
+label.fld { cursor: text; }
+.formbody input[type=text], .formbody input[type=date], .formbody textarea { width: 100%; padding: 6px 8px; background: var(--panel); border: 1px solid var(--accent); border-radius: 6px; color: var(--ink); font: inherit; }
+.formbody textarea { resize: vertical; }
+.ferr { color: var(--danger); font-size: 12px; }
+.grid tbody tr.dirty td.rn { color: var(--accent); font-weight: 600; }
+.grid tbody tr.dirty { box-shadow: inset 3px 0 0 var(--accent); }
+button.danger { color: var(--danger); border-color: var(--danger); }
+button.danger:hover { background: var(--danger-bg); }

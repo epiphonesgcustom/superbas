@@ -46,7 +46,7 @@
     for (const e of items) await walk(e, '');
     return out;
   }
-  async function filesFromDrop(dt) {
+  async function filesFromDropEntries(dt) {
     const items = [...(dt.items || [])];
     if (items.length && items[0].webkitGetAsEntry) {
       const entries = items.map(i => i.webkitGetAsEntry()).filter(Boolean); // collect before any await
@@ -55,23 +55,61 @@
     return [...dt.files].map(file => ({ file, path: file.name }));
   }
 
+  // Walk a directory handle (Chromium). Keeps file handles so a database can be saved back later.
+  async function walkHandle(dir, path, depth) {
+    const out = [], subs = [];
+    for await (const [name, h] of dir.entries()) {
+      if (h.kind === 'directory') { if (depth < 4) subs.push([name, h]); continue; }
+      if (/\.(sbf|sbd)$/i.test(name)) out.push({ file: await h.getFile(), path: path + name, handle: h, dir });
+    }
+    for (const [name, h] of subs) out.push(...await walkHandle(h, path + name + '/', depth + 1));
+    return out;
+  }
+  async function openFolder() {
+    if (window.showDirectoryPicker) {
+      try {
+        const dir = await window.showDirectoryPicker({ id: 'superbase' });
+        return addFiles(await walkHandle(dir, dir.name + '/', 0));
+      } catch (e) {
+        if (e && e.name === 'AbortError') return;
+        note('Mappen kunde inte öppnas direkt (' + (e && e.message) + '). Försöker med vanlig mappväljare – då går det inte att spara ändringar.', true);
+      }
+    }
+    $('#folderInput').click();
+  }
+  async function filesFromDrop(dt) {
+    const items = [...(dt.items || [])];
+    if (items.length && items[0].getAsFileSystemHandle) {
+      const hs = await Promise.all(items.map(i => i.getAsFileSystemHandle()));
+      if (hs.every(h => h && h.kind === 'directory')) {
+        const out = [];
+        for (const h of hs) out.push(...await walkHandle(h, h.name + '/', 0));
+        return out;
+      }
+    }
+    return filesFromDropEntries(dt);
+  }
+
   /* A database is a .SBF + .SBD pair. Every pair found in the chosen folder (and its subfolders) is opened. */
   async function addFiles(list) {
     const groups = new Map();
-    for (const { file, path } of list) {
+    for (const item of list) {
+      const { path } = item;
       const m = /^(.*?)\.(sbf|sbd)$/i.exec(path);
       if (!m) continue;
       const key = m[1].toUpperCase();
       const g = groups.get(key) || { stem: m[1].split('/').pop() };
-      g[m[2].toLowerCase()] = file;
+      g[m[2].toLowerCase()] = item;
       groups.set(key, g);
     }
     if (!groups.size) { note('Hittade inga .SBD/.SBF-filer i den valda mappen.', true); return; }
     let first = null, opened = 0;
     for (const [key, g] of groups) {
       if (!g.sbf || !g.sbd) { note(`${g.stem}: hoppades över, saknar .${g.sbf ? 'SBD' : 'SBF'}-filen.`, true); continue; }
-      const raw = { sbf: new Uint8Array(await g.sbf.arrayBuffer()), sbd: new Uint8Array(await g.sbd.arrayBuffer()) };
-      const db = addDb(key, g.stem, raw, true);
+      const raw = { sbf: new Uint8Array(await g.sbf.file.arrayBuffer()), sbd: new Uint8Array(await g.sbd.file.arrayBuffer()) };
+      const old = state.dbs.find(d => d.key === key);
+      if (old && dirtyCount(old) && !confirm(`${old.name} har ${dirtyCount(old)} osparade ändringar som går förlorade om databasen öppnas igen. Fortsätta?`)) continue;
+      const db = addDb(key, g.stem, raw, true, g.sbf.handle ? { handle: g.sbf.handle, dir: g.sbf.dir, name: g.sbf.file.name } : null);
       if (db) { opened++; first = first || db; }
     }
     if (opened > 1) note(`Öppnade ${opened} databaser.`);
@@ -82,8 +120,8 @@
     const d = SB.readDatabase(db.raw.sbf, db.raw.sbd, state.charset);
     db.fields = d.fields; db.view = d.view; db.records = d.records; db.errors = d.errors; db.expected = d.expected;
   }
-  function addDb(key, stem, raw, quiet) {
-    const db = { key, name: stem, raw };
+  function addDb(key, stem, raw, quiet, src) {
+    const db = { key, name: stem, raw, src: src || null };
     try { parseDb(db); } catch (e) { note(`${stem}: ${e.message}`, true); return null; }
     const viewSet = new Set(db.view.map(SB.norm));
     const useView = viewSet.size >= 2 && db.fields.some(f => viewSet.has(SB.norm(f.name)));
@@ -153,6 +191,14 @@
     const n = db.ui.rows.length, tot = db.records.length;
     $('#count').textContent = n === tot ? `${tot.toLocaleString('sv-SE')} poster` : `${n.toLocaleString('sv-SE')} av ${tot.toLocaleString('sv-SE')} poster`;
     $('#btnCsv').disabled = !n;
+    const editing = !!(state.edit && db.src), dc = dirtyCount(db);
+    $('#btnEdit').textContent = editing ? 'Avsluta redigering' : 'Redigera';
+    $('#btnEdit').setAttribute('aria-pressed', String(editing));
+    $('#btnEdit').disabled = !db.src;
+    $('#btnEdit').title = db.src ? 'Redigera och lägg till poster' : 'Kräver Chrome/Edge och att mappen öppnas med "Öppna mapp…"';
+    $('#btnNew').hidden = !editing || state.tab === 'form';
+    $('#btnSaveDisk').hidden = !dc;
+    $('#btnSaveDisk').textContent = `Spara till disk (${dc})`;
     if (state.tab === 'table') renderTable();
     else if (state.tab === 'form') renderForm();
     else if (state.tab === 'chart') renderChartTab();
@@ -168,6 +214,7 @@
       li.innerHTML = `<button class="pick" type="button">${esc(db.name)}<span class="n">${db.records.length}</span></button><button class="x" type="button" aria-label="Stäng ${esc(db.name)}" title="Stäng">×</button>`;
       li.firstChild.onclick = () => select(db);
       li.lastChild.onclick = () => {
+        if (dirtyCount(db) && !confirm(`${db.name} har ${dirtyCount(db)} osparade ändringar som går förlorade. Stänga ändå?`)) return;
         state.dbs = state.dbs.filter(d => d !== db);
         select(state.cur === db ? state.dbs[0] || null : state.cur);
       };
@@ -212,7 +259,7 @@
     const a = ui.page * ui.pageSize, b = Math.min(rows.length, a + ui.pageSize);
     for (let r = a; r < b; r++) {
       const rec = rows[r];
-      h += `<tr data-r="${r}"><td class="rn">${rec.id}</td>`;
+      h += `<tr data-r="${r}"${rec.dirty || rec.isNew ? ' class="dirty"' : ''}><td class="rn">${rec.isNew ? 'ny' : rec.id + (rec.dirty ? '*' : '')}</td>`;
       for (const i of cols) {
         const f = db.fields[i];
         h += `<td class="${isNum(f) || f.type === 'DAT' ? 'num' : ''}">${esc(SB.formatValue(f, rec.v[i]))}</td>`;
@@ -242,23 +289,172 @@
   /* form */
   function renderForm() {
     const db = state.cur, ui = db.ui, n = ui.rows.length;
-    $('#fPos').textContent = n ? `Post ${ui.formIdx + 1} av ${n.toLocaleString('sv-SE')}  (#${ui.rows[ui.formIdx].id})` : 'Inga poster';
-    for (const id of ['fFirst', 'fPrev']) $('#' + id).disabled = ui.formIdx <= 0;
-    for (const id of ['fNext', 'fLast']) $('#' + id).disabled = ui.formIdx >= n - 1;
-    const rec = ui.rows[ui.formIdx];
+    const editing = !!(state.edit && db.src);
+    if (!editing) ui.draft = null;
+    const draft = ui.draft;
+    $('#editBtns').hidden = !editing;
+    $('#fPos').textContent = draft ? 'Ny post (inte sparad än)' : n ? `Post ${ui.formIdx + 1} av ${n.toLocaleString('sv-SE')}  (#${ui.rows[ui.formIdx].isNew ? 'ny' : ui.rows[ui.formIdx].id})` : 'Inga poster';
+    for (const id of ['fFirst', 'fPrev']) $('#' + id).disabled = !!draft || ui.formIdx <= 0;
+    for (const id of ['fNext', 'fLast']) $('#' + id).disabled = !!draft || ui.formIdx >= n - 1;
+    const rec = draft || ui.rows[ui.formIdx];
     let h = '';
     if (rec) db.fields.forEach((f, i) => {
       if (f.type === 'DEL') { h += `<h3>${esc(f.name)}</h3>`; return; }
       const v = SB.formatValue(f, rec.v[i]);
+      const ro = f.calc || f.flags.includes('RDO');
       const wide = f.type === 'TXT' && f.len > 70;
-      h += `<div class="fld${wide ? ' wide' : ''}"><span class="lbl">${esc(f.name)}${f.calc ? ' · beräknat' : ''}</span><div class="val${isNum(f) ? ' num' : ''}">${esc(v) || '&nbsp;'}</div></div>`;
+      const label = `<span class="lbl">${esc(f.name)}${f.calc ? ' · beräknat' : ''}${editing && f.type === 'TXT' && f.len ? ` · max ${f.len} tecken` : ''}</span>`;
+      if (!editing || ro) h += `<div class="fld${wide ? ' wide' : ''}">${label}<div class="val${isNum(f) ? ' num' : ''}">${esc(v) || '&nbsp;'}</div></div>`;
+      else {
+        const attrs = `data-i="${i}" id="ef-${i}" aria-label="${esc(f.name)}"`;
+        const ctl = f.type === 'DAT' ? `<input type="date" ${attrs} value="${esc(v)}">`
+          : f.type === 'TXT' && f.len > 70 ? `<textarea rows="3" ${attrs} maxlength="${f.len}">${esc(v)}</textarea>`
+          : `<input type="text" ${attrs} value="${esc(v)}"${f.type === 'TXT' && f.len ? ` maxlength="${f.len}"` : ''}${isNum(f) ? ' inputmode="decimal"' : ''}>`;
+        h += `<label class="fld${wide ? ' wide' : ''}">${label}${ctl}<span class="ferr" data-err="${i}"></span></label>`;
+      }
     });
     $('#formBody').innerHTML = h || '<div class="noresult">Inga poster matchar.</div>';
   }
   function formGo(i) {
     const ui = state.cur.ui;
+    ui.draft = null;
     ui.formIdx = Math.max(0, Math.min(ui.rows.length - 1, i));
     renderForm();
+  }
+
+  /* ---------- editing ---------- */
+  const dirtyCount = db => db.records.reduce((n, r) => n + (r.dirty || r.isNew ? 1 : 0), 0) + (db.deletedRecs ? db.deletedRecs.length : 0);
+  let tempId = 1e9;
+
+  // text typed into a form field -> stored value (throws a Swedish message when invalid)
+  function parseInput(f, str) {
+    if (f.type === 'TXT') {
+      const t = str.replace(/\r?\n/g, ' ');
+      if (f.len && t.length > f.len) throw new Error(`Max ${f.len} tecken (nu ${t.length}).`);
+      SB.encodeText(t, state.charset);
+      return t;
+    }
+    const t = str.trim();
+    if (t === '') return null;
+    if (f.type === 'DAT') {
+      const o = SB.isoToOrd(t);
+      if (o === null || SB.ordToISO(o) !== t) throw new Error('Ogiltigt datum (åååå-mm-dd).');
+      return o;
+    }
+    const x = Number(t.replace(',', '.'));
+    if (!isFinite(x)) throw new Error('Ogiltigt tal.');
+    if (f.type === 'NMI') {
+      if (!Number.isInteger(x)) throw new Error('Heltal krävs.');
+      if (x < -2147483648 || x > 2147483647) throw new Error('Talet är för stort.');
+      return x;
+    }
+    const d = f.decimals === undefined ? 2 : f.decimals, p = Math.pow(10, d);
+    return Math.round(x * p + (x < 0 ? -1e-9 : 1e-9)) / p;
+  }
+  function getCalc(db) {
+    if (db.calc === undefined) {
+      try { db.calc = SB.makeCalc(db.fields); } catch (e) { db.calc = null; note('Kunde inte tolka formlerna för beräknade fält (' + e.message + '). De räknas inte om.', true); }
+    }
+    return db.calc;
+  }
+  function applyForm() {
+    const db = state.cur, ui = db.ui;
+    const base = ui.draft || ui.rows[ui.formIdx];
+    if (!base) return;
+    const v = base.v.slice();
+    let bad = 0;
+    document.querySelectorAll('#formBody [data-err]').forEach(e => { e.textContent = ''; });
+    document.querySelectorAll('#formBody [data-i]').forEach(el => {
+      const i = +el.dataset.i;
+      try { v[i] = parseInput(db.fields[i], el.value); }
+      catch (e) { bad++; $(`[data-err="${i}"]`).textContent = e.message; }
+    });
+    if (bad) { note(`${bad} fält har fel – rätta dem och försök igen.`, true); return; }
+    const calc = getCalc(db);
+    if (calc) calc(v);
+    if (ui.draft) {
+      const rec = { id: ++tempId, v, isNew: true };
+      db.records.push(rec);
+      ui.draft = null;
+      runQuery(db, true);
+      const at = ui.rows.indexOf(rec);
+      if (at >= 0) ui.formIdx = at; else note('Posten är tillagd men matchar inte den aktuella sökningen. Klicka Rensa för att se den.');
+    } else if (JSON.stringify(v) !== JSON.stringify(base.v)) {
+      base.v = v; base.dirty = true;
+      runQuery(db, true);
+      const at = ui.rows.indexOf(base);
+      if (at >= 0) ui.formIdx = at;
+    }
+    renderTab();
+  }
+  function deleteRecord() {
+    const db = state.cur, ui = db.ui, rec = ui.rows[ui.formIdx];
+    if (!rec || ui.draft) return;
+    if (!confirm('Ta bort den här posten? Den försvinner från databasen när du sparar till disk (en säkerhetskopia av filen skapas först).')) return;
+    db.records.splice(db.records.indexOf(rec), 1);
+    if (!rec.isNew) { rec.deleted = true; (db.deletedRecs || (db.deletedRecs = [])).push(rec); }
+    runQuery(db, true);
+    ui.formIdx = Math.min(ui.formIdx, Math.max(0, ui.rows.length - 1));
+    renderTab();
+  }
+  function newRecord() {
+    const db = state.cur;
+    db.ui.draft = { v: db.fields.map(f => f.type === 'TXT' ? '' : null) };
+    state.tab = 'form';
+    renderTab();
+  }
+  async function toggleEdit() {
+    const db = state.cur;
+    if (!db) return;
+    if (state.edit) { state.edit = false; renderTab(); return; }
+    if (!db.src) { note('Redigering kräver Chrome eller Edge och att mappen öppnas med "Öppna mapp…" (inte via vanlig filväljare).', true); return; }
+    try {
+      if ((await db.src.handle.requestPermission({ mode: 'readwrite' })) !== 'granted') { note('Skrivåtkomst nekades.', true); return; }
+    } catch (e) { note('Kunde inte begära skrivåtkomst: ' + e.message, true); return; }
+    state.edit = true;
+    renderTab();
+  }
+  const bytesEqual = (a, b) => { if (a.length !== b.length) return false; for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false; return true; };
+  const stamp = () => new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+  const readBytes = async h => new Uint8Array(await (await h.getFile()).arrayBuffer());
+
+  async function saveToDisk() {
+    const db = state.cur, n = db && dirtyCount(db);
+    if (!db || !n || !db.src) return;
+    const btn = $('#btnSaveDisk');
+    btn.disabled = true;
+    try {
+      if ((await db.src.handle.requestPermission({ mode: 'readwrite' })) !== 'granted') throw new Error('Skrivåtkomst nekades.');
+      const cur = await readBytes(db.src.handle);
+      if (!bytesEqual(cur, db.raw.sbf)) throw new Error('Filen har ändrats på disken sedan du öppnade den (till exempel av Superbase). Inget sparades – öppna mappen igen.');
+      const gone = db.deletedRecs || [];
+      const { bytes, newIds } = SB.applyEdits(cur, db.fields, db.records.concat(gone), state.charset);
+      if (!db.backupName) {
+        const name = `${db.src.name}.${stamp()}.bak`;
+        const bw = await (await db.src.dir.getFileHandle(name, { create: true })).createWritable();
+        await bw.write(cur); await bw.close();
+        db.backupName = name;
+      }
+      const w = await db.src.handle.createWritable();
+      await w.write(bytes); await w.close();
+      const back = await readBytes(db.src.handle);
+      if (!bytesEqual(back, bytes)) throw new Error(`Kontrollen efter skrivning misslyckades. Återställ ${db.src.name} från säkerhetskopian ${db.backupName}.`);
+      const ids = new Map(newIds);
+      const check = SB.readDatabase(back, db.raw.sbd, state.charset);
+      const byId = new Map(check.records.map(r => [r.id, r]));
+      const mismatch = db.records.some(r => { const c = byId.get(ids.has(r) ? ids.get(r) : r.id); return !c || JSON.stringify(c.v) !== JSON.stringify(r.v); });
+      const goneIds = new Set(gone.map(r => r.id));
+      if (mismatch || check.records.length !== db.records.length || check.records.some(r => goneIds.has(r.id))) throw new Error(`Kontrollläsningen stämde inte med det som skulle sparas. Återställ ${db.src.name} från säkerhetskopian ${db.backupName}.`);
+      for (const r of db.records) { if (ids.has(r)) r.id = ids.get(r); r.dirty = false; r.isNew = false; }
+      db.deletedRecs = [];
+      db.raw = { sbf: back, sbd: db.raw.sbd };
+      runQuery(db, true);
+      note(`Sparade ${n} ändringar i ${db.src.name}. Säkerhetskopia: ${db.backupName}. Indexfilerna (.1, .2 …) är inte uppdaterade – kör omindexering i Superbase innan du söker där.`);
+    } catch (e) {
+      note('Sparandet misslyckades: ' + e.message, true);
+    }
+    btn.disabled = false;
+    renderTab();
   }
 
   /* structure */
@@ -564,10 +760,20 @@
   }
 
   function init() {
-    $('#btnOpen').onclick = () => $('#folderInput').click(); $('#btnOpen2').onclick = () => $('#folderInput').click();
+    $('#btnOpen').onclick = openFolder; $('#btnOpen2').onclick = openFolder;
     $('#folderInput').onchange = e => { addFiles([...e.target.files].map(file => ({ file, path: file.webkitRelativePath || file.name }))); e.target.value = ''; };
     
-    $('#charset').onchange = e => { state.charset = e.target.value; reparseAll(); };
+    $('#charset').onchange = e => {
+      if (state.dbs.some(dirtyCount)) { e.target.value = state.charset; note('Spara eller avsluta ändringarna innan du byter teckenuppsättning.', true); return; }
+      state.charset = e.target.value; reparseAll();
+    };
+    $('#btnEdit').onclick = toggleEdit;
+    $('#btnNew').onclick = newRecord; $('#fNew').onclick = newRecord;
+    $('#fApply').onclick = applyForm;
+    $('#fDelete').onclick = deleteRecord;
+    $('#fRevert').onclick = () => { const ui = state.cur.ui; if (ui.draft) { ui.draft = null; renderTab(); } else renderForm(); };
+    $('#btnSaveDisk').onclick = saveToDisk;
+    window.addEventListener('beforeunload', e => { if (state.dbs.some(dirtyCount)) { e.preventDefault(); e.returnValue = ''; } });
 
     let depth = 0;
     window.addEventListener('dragenter', e => { e.preventDefault(); depth++; document.body.classList.add('dragging'); });
@@ -636,5 +842,5 @@
   }
 
   init();
-  window.__sbApp = { state, addFiles, addDb, select, renderTab };
+  window.__sbApp = { deleteRecord, toggleEdit, applyForm, saveToDisk, newRecord, state, addFiles, addDb, select, renderTab };
 })();
